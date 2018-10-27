@@ -42,6 +42,13 @@ def fitness_proportionate_selection(
     return i
 
 
+def fermi_funtion(beta, first, second):
+    '''
+    The fermi function determines the probability that the first type imitates the second
+    '''
+    return 1. / (1. + np.exp(-beta * (first - second)))
+
+
 class MoranProcess(object):
     def __init__(
         self,
@@ -526,3 +533,127 @@ class ApproximateMoranProcess(MoranProcess):
         except KeyError:  # If players are stored in opposite order
             match_scores = self.cached_outcomes[player_names[::-1]].sample()
             return match_scores[::-1]
+
+
+class PairwiseComparisonMoranProcess(MoranProcess):
+    """
+        A class to approximate a Moran process based
+        on a distribution of potential Match outcomes.
+
+        Instead of playing the matches, the result is sampled
+        from a dictionary of player tuples to distribution of match outcomes
+        """
+
+    def __init__(
+        self, players: List[Player], turns: int =0, mutation_rate: float = 0,
+        beta: float = 0.1
+    ) -> None:
+        """
+        Parameters
+        ----------
+        players:
+        cached_outcomes:
+            Mapping tuples of players to instances of the moran.Pdf class.
+        mutation_rate:
+            The rate of mutation. Replicating players are mutated with
+            probability `mutation_rate`
+        beta:
+            Intensity of selection. Defines how important is the payoff
+            for the selection process
+        """
+        super(PairwiseComparisonMoranProcess, self).__init__(
+            players,
+            turns=turns,
+            noise=0,
+            deterministic_cache=None,
+            mutation_rate=mutation_rate,
+        )
+        self.beta = beta
+
+    def __next__(self) -> object:
+        """
+        Iterate the population:
+
+        - play the round's matches
+        - chooses a player proportionally to fitness (total score) to reproduce
+        - chooses 2 players at random
+        - mutate, if appropriate
+        - choose a player to be replaced
+        - update the population
+
+        Returns
+        -------
+        MoranProcess:
+            Returns itself with a new population
+        """
+        # Check the exit condition, that all players are of the same type.
+        if self.fixation_check():
+            raise StopIteration
+
+        # Selects 2 players randomly
+        players = np.random.choice(self.locations, replace=True, size=2)
+
+        # Score these 2 players
+        score1 = self.score_player(players[0])
+        score2 = self.score_player(players[1])
+        if np.random.rand() < fermi_funtion(self.beta, score1, score2):
+            reproduce = self.index[players[0]]
+            die = self.index[players[1]]
+        else:
+            reproduce = self.index[players[1]]
+            die = self.index[players[0]]
+
+        # Select which player should imitate the other
+        if self.mutation_rate:
+            new_player = self.mutate(reproduce)
+        else:
+            new_player = self.players[reproduce].clone()
+        # Replace player i with clone of player j
+        self.players[die] = new_player
+        self.populations.append(self.population_distribution())
+        # Check again for fixation
+        self.fixation_check()
+        return self
+
+    def score_player(self, player):
+        score = 0
+        for i, j in self._matchup_index(player):
+            player1 = self.players[i]
+            player2 = self.players[j]
+            match = Match(
+                (player1, player2),
+                turns=self.turns,
+                prob_end=self.prob_end,
+                noise=self.noise,
+                game=self.game,
+                deterministic_cache=self.deterministic_cache,
+            )
+            match.play()
+            match_scores = match.final_score_per_turn()
+            score += match_scores[0]
+        self.score_history.append((self.index[player], score))
+        return score / (len(self.players) - 1)
+
+    def _matchup_index(self, source) -> Set[int]:
+        """
+        Generate the matchup pairs.
+
+        Returns
+        -------
+        indices:
+            A set of 2 tuples of matchup pairs: the collection of all players
+            who play each other.
+        """
+        indices = set()  # type: Set
+        # For death-birth we only want the neighbors of the dead node
+        # The other calculations are unnecessary
+        i = self.index[source]
+        for target in sorted(self.interaction_graph.out_vertices(source)):
+            j = self.index[target]
+            if (self.players[i] is None) or (self.players[j] is None):
+                continue
+            # Don't duplicate matches
+            if ((i, j) in indices) or ((j, i) in indices):
+                continue
+            indices.add((i, j))
+        return indices
